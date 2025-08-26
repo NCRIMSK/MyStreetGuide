@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Dimensions, View, StyleSheet, Text, Button, Linking, TouchableOpacity, ActivityIndicator  } from 'react-native';
-import { Camera, useCameraDevices } from 'react-native-vision-camera';
+import { Dimensions, View, StyleSheet, Text, Button, Linking, TouchableOpacity, ActivityIndicator, AppState, AppStateStatus  } from 'react-native';
+import { Camera, useCameraDevice } from 'react-native-vision-camera';
 import RNFS from 'react-native-fs';
 import { useLocationAndDeclination } from './useLocationAndDeclination';
 import { useCalibratedMagnetometer } from './useCalibratedMagnetometer';
@@ -12,11 +12,22 @@ type Coordinates = { latitude: number; longitude: number };
 
 const App = () => {
   const [hasPermission, setHasPermission] = useState<null | boolean>(null);
-  const [deviceToUse, setDeviceToUse] = useState<any>(null);
+  // Camera device selection via VisionCamera hooks
+  const backDevice = useCameraDevice('back');
+  const frontDevice = useCameraDevice('front');
+  const deviceToUse = backDevice ?? frontDevice ?? null;
+  const [isAppActive, setIsAppActive] = useState(true);
   const [compassDirection, setCompassDirection] = useState<number | null>(null);
   const [address, setAddress] = useState<string | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+  const [showSteps, setShowSteps] = useState(false);
+  const [steps, setSteps] = useState<Array<{id: string; label: string; status: 'pending'|'in_progress'|'done'}>>([]);
 
-  const devices = useCameraDevices();
+  // Smooth heading animation state
+  const [smoothedHeading, setSmoothedHeading] = useState(0);
+  const targetHeadingRef = useRef<number>(0);
+  const smootherTimerRef = useRef<any>(null);
+
   const camera = useRef<Camera | null>(null);
   const NUM_CALIBRATION_SAMPLES = 50;
   
@@ -98,19 +109,41 @@ useEffect(() => {
   }, []);
 
 
+  // No custom device selection effect needed with useCameraDevice
+
+  // Manage Camera lifecycle with AppState to avoid device lock and recover on resume
   useEffect(() => {
-    // Prefer back camera, fallback to front
-    // @ts-ignore vision-camera types differ across versions
-    const chosen = (devices as any)?.back || (devices as any)?.front || null;
-    setDeviceToUse(chosen);
-  }, [devices]);
+    const sub = AppState.addEventListener('change', (next: AppStateStatus) => {
+      const active = next === 'active';
+      setIsAppActive(active);
+      // VisionCamera hooks will update device automatically; nothing else needed here
+    });
+    return () => sub.remove();
+  }, [hasPermission]);
 
   // Continuously update true heading in state
   useEffect(() => {
     if (calibratedHeading == null) return;
     const trueHeading = (calibratedHeading + (magneticDeclination ?? 0) + 360) % 360;
     setCompassDirection(trueHeading);
+    targetHeadingRef.current = trueHeading;
   }, [calibratedHeading, magneticDeclination]);
+
+  // Start smoothing loop (EMA toward target) for continuous, smooth rotation
+  useEffect(() => {
+    if (smootherTimerRef.current) return;
+    smootherTimerRef.current = setInterval(() => {
+      setSmoothedHeading(prev => {
+        const target = targetHeadingRef.current ?? 0;
+        let diff = ((target - prev + 540) % 360) - 180; // shortest-arc delta
+        const alpha = 0.18; // smoothing factor
+        let next = prev + alpha * diff;
+        next = ((next % 360) + 360) % 360; // normalize to [0,360)
+        return next;
+      });
+    }, 50); // ~20 FPS
+    return () => { clearInterval(smootherTimerRef.current); smootherTimerRef.current = null; };
+  }, []);
 
   if (hasPermission === null) {
     console.log('Запрос разрешения');
@@ -132,11 +165,13 @@ useEffect(() => {
     );
   }
 
- if (!deviceToUse) {
-    console.log('Нет доступных камер, показываем сообщение...');
+  if (hasPermission && !deviceToUse) {
+    // While devices are loading or temporarily unavailable, show a light placeholder
     return (
       <View style={styles.center}>
-        <Text>Нет доступных камер.</Text>
+        <ActivityIndicator />
+        <Text>Инициализация камеры…</Text>
+        <Button title="Проверить разрешения" onPress={checkCameraPermission} />
       </View>
     );
   }
@@ -144,16 +179,28 @@ useEffect(() => {
   
   
 const takePhoto = async () => {
+  if (isBusy) return;
+  setIsBusy(true);
+  setShowSteps(true);
+  setSteps([
+    { id: 'loc', label: 'getting location', status: 'in_progress' },
+    { id: 'dir', label: 'getting direction', status: 'pending' },
+    { id: 'calc', label: 'calculated coords', status: 'pending' },
+    { id: 'osm', label: 'sending coords to OSM', status: 'pending' },
+  ]);
   if (!camera.current) {
     console.log('TakePhoto: ref missing');
+    setIsBusy(false); setShowSteps(false);
     return;
   }
   if (isCalibrating || calibratedHeading === null) {
   console.log("Компас ещё калибруется, пожалуйста, подождите.");
+  setIsBusy(false); setShowSteps(false);
   return;
   }
   if (loadingLocation) {
     console.log("Местоположение ещё загружается, пожалуйста, подождите.");
+    setIsBusy(false); setShowSteps(false);
     return;
   }
   
@@ -173,17 +220,24 @@ const takePhoto = async () => {
     console.log("Сначала нужно получить координаты");
         return null;
 	}
+	// Steps: mark getting location done, direction in progress/done
+    setSteps(prev => prev.map(s => s.id === 'loc' ? {...s, status: 'done'} : s));
+
 	const bearing = ((calibratedHeading ?? 0) + (magneticDeclination ?? 0) + 360) % 360;
+    setSteps(prev => prev.map(s => s.id === 'dir' ? {...s, status: 'done'} : s));
 	const startLatitude = coordinates.latitude
 	const startLongitude = coordinates.longitude
 	const result = getDestinationPoint(startLatitude, startLongitude, bearing, distance);
+    setSteps(prev => prev.map(s => s.id === 'calc' ? {...s, status: 'done'} : s));
 	
 	
+	setSteps(prev => prev.map(s => s.id === 'osm' ? {...s, status: 'in_progress'} : s));
 	const geoData = await reverseGeocode(result.endLatitude, result.endLongitude);
         if (geoData && geoData.address) {
           // Например, можно сохранить полный форматированный адрес
           setAddress(geoData.display_name);
           console.log("Полученный адрес:", geoData.display_name);
+          setSteps(prev => prev.map(s => s.id === 'osm' ? {...s, status: 'done'} : s));
         } else {
           console.log("Адрес не найден");
         }
@@ -224,14 +278,20 @@ const findBuildingAddress = async () => {
   if (!found) {
     console.log("Здание не найдено в пределах заданного диапазона.");
   }
+  return found;
 };
 
-	// После того как вы получили координаты и compassDirection...
-await findBuildingAddress();
+// После того как вы получили координаты и compassDirection...
+const success = await findBuildingAddress();
+
+// Hide steps/log only when final address obtained
+if (success) setShowSteps(false);
+setIsBusy(false);
 
   } catch (err) {
     console.log('takePhoto: error', err);
   }
+  setIsBusy(false);
 };
   
 return (
@@ -252,18 +312,20 @@ return (
   </View>
 )}
 <Camera
-        key={deviceToUse.id}
+        key={deviceToUse?.id}
         ref={camera}
         style={StyleSheet.absoluteFill}
         device={deviceToUse}
-        isActive={true}
+        isActive={isAppActive && hasPermission === true}
 		photo={true} // Включает возможность съемки фото
+        onInitialized={() => console.log('Camera initialized')}
+        onError={e => console.log('Camera error', e)}
       />
 <TouchableOpacity style={styles.calibrateButton} onPress={calibrate}>
          <Text style={styles.calibrateButtonText}>Калибровать</Text>
       </TouchableOpacity>
 	  
-<TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
+<TouchableOpacity style={[styles.captureButton, isBusy && styles.captureButtonBusy]} onPress={takePhoto} disabled={isBusy}>
 
       </TouchableOpacity>
 	  
@@ -279,7 +341,7 @@ return (
           {`Acc: ${accuracy != null ? Math.round(accuracy) : '--'} m`}
         </Text>
         <Text style={styles.coordinatesText}>
-                {`Dir: ${compassDirection}°`}
+                {`Dir: ${Math.round(smoothedHeading)}°`}
               </Text>
       </View>
 	  ) : (
@@ -299,18 +361,30 @@ return (
 		<View style={styles.crosshairVertical} />
 	</View>
 
-    {/* Simple compass visualization */}
-    <View style={styles.compassContainer}>
-      <View style={styles.compassCircle}>
-        <View
-          style={[
-            styles.compassNeedle,
-            { transform: [{ rotate: `${Math.round(compassDirection ?? 0)}deg` }] },
-          ]}
-        />
-        <Text style={styles.compassText}>{`${Math.round(compassDirection ?? 0)}°`}</Text>
+    {/* Centered ellipse compass with smooth arrow */}
+    <View style={styles.compassEllipseContainer} pointerEvents="none">
+      <View style={styles.ellipseRing} />
+      <View
+        style={[
+          styles.arrowContainer,
+          { transform: [{ rotate: `${-(smoothedHeading ?? 0)}deg` }] },
+        ]}
+      >
+        <View style={styles.arrowTriangle} />
+        <View style={styles.arrowStem} />
       </View>
     </View>
+
+    {/* Steps overlay */}
+    {showSteps && (
+      <View style={styles.stepsContainer}>
+        {steps.map(step => (
+          <Text key={step.id} style={styles.stepsText}>
+            {`${step.label} - ${step.status}`}
+          </Text>
+        ))}
+      </View>
+    )}
     </View>
   );
 };
@@ -348,7 +422,7 @@ addressText: {
 },
 
 
-captureButton: {
+  captureButton: {
   position: 'absolute',
   bottom: height * 0.1, // 10% от высоты экрана
   alignSelf: 'center',
@@ -357,8 +431,12 @@ captureButton: {
   borderRadius: width * 0.1, // Половина ширины = круг
   borderWidth: width * 0.01, // 1% ширины экрана
   borderColor: 'rgba(255, 255, 255, 0.3)', // Белый с прозрачностью 30%
-  backgroundColor: 'transparent',
-},
+    backgroundColor: 'transparent',
+  },
+  captureButtonBusy: {
+    backgroundColor: 'rgba(255,0,0,0.4)',
+    borderColor: 'rgba(255,0,0,0.8)',
+  },
    
 crosshairContainer: {
   // Добавлено: контейнер для кроссхэйра, центрированный на экране
@@ -414,36 +492,63 @@ finishButtonText: {
   color: '#fff',
   fontSize: 14,
 },
-// Compass styles
-compassContainer: {
-  position: 'absolute',
-  top: 10,
-  left: 10,
-},
-compassCircle: {
-  width: 80,
-  height: 80,
-  borderRadius: 40,
-  backgroundColor: 'rgba(0,0,0,0.4)',
-  borderWidth: 1,
-  borderColor: 'rgba(255,255,255,0.25)',
-  justifyContent: 'center',
-  alignItems: 'center',
-},
-compassNeedle: {
-  position: 'absolute',
-  width: 2,
-  height: 34,
-  backgroundColor: '#ff5252',
-  top: 6,
-  borderRadius: 1,
-},
-compassText: {
-  position: 'absolute',
-  bottom: 6,
-  color: '#fff',
-  fontSize: 12,
-},
+  // Centered ellipse compass styles
+  compassEllipseContainer: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    width: width * 0.5,
+    height: width * 0.32,
+    transform: [{ translateX: -(width * 0.25) }, { translateY: -(width * 0.16) }],
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  ellipseRing: {
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.35)',
+    borderRadius: width, // large radius to create oval edges
+    backgroundColor: 'rgba(0,0,0,0.15)',
+  },
+  arrowContainer: {
+    width: width * 0.5,
+    height: width * 0.32,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  arrowTriangle: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 10,
+    borderRightWidth: 10,
+    borderBottomWidth: 36,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: '#ff5252',
+  },
+  arrowStem: {
+    width: 3,
+    height: 38,
+    backgroundColor: '#ff5252',
+    marginTop: 6,
+    borderRadius: 2,
+  },
+  stepsContainer: {
+    position: 'absolute',
+    bottom: height * 0.22,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    padding: 10,
+    borderRadius: 6,
+    minWidth: width * 0.6,
+  },
+  stepsText: {
+    color: '#fff',
+    fontSize: 14,
+    marginVertical: 2,
+  },
 calibrationOverlay: {
   position: 'absolute',
   top: 0,

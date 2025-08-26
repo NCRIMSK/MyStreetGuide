@@ -1,0 +1,744 @@
+Compas updates to often. Also displayed accuracy is 20m, check again that everything is ok with accuracy.Also when i press a button i need see the steps list like: getting location - done, getting direction - done, calculated coords - done, sending coords to OSM - pending etc. while getting address the button should become red and blocked, until the app have the adress, after getting an adress the log should disappear,also need to improve the accuracy of the compass and render it in the center of screen as an ellipse with an arrow that moves smoothly and continuously points to North; decide and implement improvements if they will not cause conflicts, be careful with unrelated code, here are the proposed code improvements:
+
+## Goal
+
+* Continuous, **true-north** compass with **stable heading** (sensor fusion + tilt compensation + declination).
+* **Smooth animation** with shortest-arc interpolation (no jitter, no wrap jumps).
+* **Ellipse + arrow UI** drawn on a canvas; arrow always points to geographic North.
+* Clean, battery-aware sensor pipeline; quality gates against magnetic interference.
+
+## Requirements
+
+* Platform: **Android (Kotlin)** with **Jetpack Compose** UI.
+* Sensors: prefer **TYPE\_ROTATION\_VECTOR**; fallback to **ACCELEROMETER + MAGNETIC\_FIELD**.
+* Sampling: `SENSOR_DELAY_GAME` (\~50 Hz).
+* Smoothing: exponential moving average on angles with wrap-aware interpolation.
+* **True North**: add **magnetic declination** via `GeomagneticField` (needs last known location; if unavailable, fall back to magnetic north).
+* Quality gates:
+
+  * If `SensorEvent.accuracy == SENSOR_STATUS_UNRELIABLE` → show subtle “Move phone in a ∞ to calibrate”.
+  * Reject updates when magnetic field magnitude is outside \~**30–60 µT** (likely interference).
+* UI:
+
+  * Draw **ellipse** (oval ring).
+  * Draw **arrow** (triangle) centered in the ellipse.
+  * Arrow rotation = **−headingDegrees** so it points to North on screen.
+  * Use `Animatable` with a custom angle interpolator for extra smoothness.
+
+## Deliverables (create these files)
+
+### `CompassEngine.kt`
+
+```kotlin
+package com.example.compass
+
+import android.content.Context
+import android.hardware.*
+import android.location.Location
+import android.os.SystemClock
+import kotlin.math.*
+
+class CompassEngine(
+    private val context: Context,
+    private val onHeading: (headingTrueDeg: Float, magneticµT: Float, acc: Int) -> Unit
+) : SensorEventListener {
+
+    private val sm: SensorManager = context.getSystemService(SensorManager::class.java)
+    private val rotVec: Sensor? = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    private val accel: Sensor? = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val mag: Sensor? = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+    // Fallback buffers
+    private val accelVals = FloatArray(3)
+    private val magVals = FloatArray(3)
+    private var hasAccel = false
+    private var hasMag = false
+
+    private val R = FloatArray(9)
+    private val I = FloatArray(9)
+    private val orientation = FloatArray(3)
+
+    // Smoothing state
+    private var hasSmoothed = false
+    private var smoothedHeading = 0f
+
+    // Declination inputs (optional)
+    @Volatile private var lastLocation: Location? = null
+
+    fun updateLocation(location: Location?) { lastLocation = location }
+
+    fun start() {
+        // Prefer fused rotation vector
+        rotVec?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        // Also listen to fallback sensors in case rotVec is absent or noisy
+        accel?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        mag?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+    }
+
+    fun stop() {
+        sm.unregisterListener(this)
+        hasSmoothed = false
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { /* surfaced via onHeading */ }
+
+    override fun onSensorChanged(ev: SensorEvent) {
+        when (ev.sensor.type) {
+            Sensor.TYPE_ROTATION_VECTOR -> handleRotationVector(ev)
+            Sensor.TYPE_ACCELEROMETER -> { System.arraycopy(ev.values, 0, accelVals, 0, 3); hasAccel = true; maybeFallback() }
+            Sensor.TYPE_MAGNETIC_FIELD -> { System.arraycopy(ev.values, 0, magVals, 0, 3); hasMag = true; maybeFallback(ev) }
+        }
+    }
+
+    private fun handleRotationVector(ev: SensorEvent) {
+        SensorManager.getRotationMatrixFromVector(R, ev.values)
+        // Remap so 0° means North with device held upright (portrait)
+        val outR = FloatArray(9)
+        SensorManager.remapCoordinateSystem(R, SensorManager.AXIS_X, SensorManager.AXIS_Y, outR)
+        SensorManager.getOrientation(outR, orientation)
+        var azimuthDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+        if (azimuthDeg < 0f) azimuthDeg += 360f
+
+        val trueDeg = applyDeclination(azimuthDeg)
+        dispatchSmoothed(trueDeg, /*mag µT unknown here*/ Float.NaN, SensorManager.SENSOR_STATUS_ACCURACY_HIGH)
+    }
+
+    private fun maybeFallback(magEvent: SensorEvent? = null) {
+        if (hasAccel && hasMag) {
+            val ok = SensorManager.getRotationMatrix(R, I, accelVals, magVals)
+            if (!ok) return
+            val outR = FloatArray(9)
+            SensorManager.remapCoordinateSystem(R, SensorManager.AXIS_X, SensorManager.AXIS_Y, outR)
+            SensorManager.getOrientation(outR, orientation)
+            var azimuthDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+            if (azimuthDeg < 0f) azimuthDeg += 360f
+
+            val trueDeg = applyDeclination(azimuthDeg)
+
+            // Magnetic field magnitude for interference check
+            val magµT = sqrt(magVals[0]*magVals[0] + magVals[1]*magVals[1] + magVals[2]*magVals[2])
+            val acc = magEvent?.accuracy ?: SensorManager.SENSOR_STATUS_ACCURACY_LOW
+            dispatchSmoothed(trueDeg, magµT, acc)
+        }
+    }
+
+    private fun applyDeclination(magneticDeg: Float): Float {
+        val loc = lastLocation
+        val decl = if (loc != null) {
+            val nowMs = System.currentTimeMillis()
+            val geo = android.hardware.GeomagneticField(
+                loc.latitude.toFloat(),
+                loc.longitude.toFloat(),
+                loc.altitude.toFloat(),
+                nowMs
+            )
+            geo.declination // degrees; add to magnetic heading to get true
+        } else 0f
+        var trueDeg = magneticDeg + decl
+        trueDeg %= 360f
+        if (trueDeg < 0f) trueDeg += 360f
+        return trueDeg
+    }
+
+    private fun dispatchSmoothed(targetDeg: Float, magµT: Float, acc: Int) {
+        val alpha = 0.12f // smoothing factor; lower = smoother
+        smoothedHeading = if (!hasSmoothed) {
+            hasSmoothed = true; targetDeg
+        } else {
+            smoothAngle(smoothedHeading, targetDeg, alpha)
+        }
+
+        // Optional: additional low-pass via time-based coast if events are too fast
+        onHeading(smoothedHeading, magµT, acc)
+    }
+
+    // Wrap-aware shortest-arc interpolation
+    private fun smoothAngle(prev: Float, target: Float, alpha: Float): Float {
+        var diff = ((target - prev + 540f) % 360f) - 180f
+        val next = (prev + alpha * diff)
+        return (next % 360f + 360f) % 360f
+    }
+}
+```
+
+### `CompassView.kt` (Jetpack Compose UI with ellipse + arrow)
+
+```kotlin
+package com.example.compass
+
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.location.Location
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.app.ActivityCompat
+import com.google.android.gms.location.LocationServices
+import kotlinx.coroutines.launch
+import kotlin.math.min
+
+@Composable
+fun CompassScreen(
+    modifier: Modifier = Modifier
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    // Engine
+    val headingState = remember { mutableStateOf(0f) }
+    val accuracyState = remember { mutableStateOf(Int.MIN_VALUE) }
+    val magState = remember { mutableStateOf(Float.NaN) }
+    val engine = remember {
+        CompassEngine(ctx) { heading, mag, acc ->
+            headingState.value = heading
+            if (!mag.isNaN()) magState.value = mag
+            accuracyState.value = acc
+        }
+    }
+
+    // Optional: fetch last known location for declination
+    val fused = remember { LocationServices.getFusedLocationProviderClient(ctx) }
+    LaunchedEffect(Unit) {
+        if (ActivityCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            fused.lastLocation.addOnSuccessListener { loc: Location? -> engine.updateLocation(loc) }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        engine.start()
+        onDispose { engine.stop() }
+    }
+
+    // Extra smooth animation on the UI layer (wrap-aware)
+    val animatedAngle = remember { Animatable(headingState.value) }
+    LaunchedEffect(headingState.value) {
+        val from = animatedAngle.value
+        val to = headingState.value
+        val shortest = shortestDelta(from, to)
+        animatedAngle.animateTo(
+            targetValue = from + shortest,
+            animationSpec = tween(durationMillis = 120) // adjust for feel
+        )
+        // Normalize back to [0,360)
+        animatedAngle.snapTo(normDeg(animatedAngle.value))
+    }
+
+    Column(
+        modifier = modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        CompassEllipseArrow(angleDeg = animatedAngle.value, size = 260.dp)
+
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = "Heading: ${animatedAngle.value.toInt()}°  ${qualityLabel(accuracyState.value, magState.value)}",
+            style = MaterialTheme.typography.bodyMedium
+        )
+    }
+}
+
+private fun shortestDelta(from: Float, to: Float): Float {
+    var diff = ((to - from + 540f) % 360f) - 180f
+    return diff
+}
+private fun normDeg(v: Float): Float = ((v % 360f) + 360f) % 360f
+
+@Composable
+private fun CompassEllipseArrow(angleDeg: Float, size: androidx.compose.ui.unit.Dp) {
+    Box(modifier = Modifier.size(size)) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.minDimension.toPx()
+            val h = size.minDimension.toPx() * 0.8f // make ellipse (80% of width)
+            val cx = size.center.x
+            val cy = size.center.y
+            val left = cx - w / 2f
+            val top = cy - h / 2f
+
+            // Ellipse outline
+            drawOval(
+                color = androidx.compose.ui.graphics.Color.LightGray,
+                topLeft = Offset(left, top),
+                size = Size(w, h),
+                style = androidx.compose.ui.graphics.Stroke(width = 6f)
+            )
+
+            // Arrow path (triangle) centered; points "north" when angle=0
+            val arrowPath = Path().apply {
+                val arrowLen = min(w, h) * 0.33f
+                val halfBase = arrowLen * 0.18f
+                // Build pointing up in local space
+                moveTo(cx, cy - arrowLen)
+                lineTo(cx - halfBase, cy + halfBase)
+                lineTo(cx + halfBase, cy + halfBase)
+                close()
+            }
+
+            // Rotate by -angle so arrow points to North
+            rotate(degrees = -angleDeg, pivot = Offset(cx, cy)) {
+                drawPath(
+                    path = arrowPath,
+                    color = androidx.compose.ui.graphics.Color.Red
+                )
+            }
+        }
+    }
+}
+
+private fun qualityLabel(acc: Int, mag: Float): String {
+    val bias = when (acc) {
+        SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "OK"
+        SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "MED"
+        SensorManager.SENSOR_STATUS_ACCURACY_LOW -> "LOW"
+        SensorManager.SENSOR_STATUS_UNRELIABLE -> "UNRELIABLE"
+        else -> "?"
+    }
+    val magTxt = if (mag.isNaN()) "" else " | B=${"%.1f".format(mag)}µT"
+    return "$bias$magTxt"
+}
+```
+
+### `MainActivity.kt` (Compose host)
+
+```kotlin
+package com.example.compass
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                Surface { CompassScreen() }
+            }
+        }
+    }
+}
+```
+
+### `AndroidManifest.xml` (add if not present)
+
+```xml
+<manifest ...>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <application ...>
+        <activity android:name=".MainActivity"
+                  android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+```
+
+> Note: Location permission is **only** to compute **declination** (true north). Without it, the compass still works but shows **magnetic north**.
+
+### `build.gradle` (module)
+
+```gradle
+dependencies {
+    implementation "androidx.compose.ui:ui:1.7.0"
+    implementation "androidx.compose.material3:material3:1.2.1"
+    implementation "com.google.android.gms:play-services-location:21.3.0"
+}
+```
+
+## How it works (concise)
+
+* **Rotation vector** gives a tilt-compensated orientation; we remap axes for portrait and compute `azimuth`.
+* **True north** = `magneticHeading + declination` (from `GeomagneticField(lat, lon, alt, time)`).
+* **Smoothing** uses wrap-aware EMA: `prev + α * shortestDelta(prev, target)`.
+* **UI rotation** uses `-heading` so the arrow indicates North; ellipse is just visual framing.
+* **Interference guard**: drop/flag when magnetic magnitude out of 30–60 µT or accuracy unreliable.
+
+## Optional (if background operation is required)
+
+* Wrap `CompassEngine` in a **foreground service** with a persistent notification and a **broadcast/Flow** to the UI.
+
+## Quick checks
+
+* Turn slowly through 360°: arrow motion stays monotonic, no snap at 0/360.
+* Under steel table or next to speaker magnets: label shows LOW/UNRELIABLE and arrow damps/stabilizes.
+* Toggle GPS permission: with permission → “Heading” matches maps true-north; without → slight offset (magnetic north).
+
+Yes—on Android with React Native (CLI) you can apply this 1:1 by exposing a tiny native module that streams a **true-north, tilt-compensated, smoothed heading** and drawing an **ellipse + arrow** in RN. Below is a copy-paste, minimal setup.
+
+# What you’ll get
+
+* **Native Kotlin engine** (rotation vector → true north via `GeomagneticField` + EMA smoothing + interference guard).
+* **RN bridge** that emits `CompassHeading` events.
+* **RN UI** (with `react-native-svg`) that draws an **ellipse** and a **smoothly rotating arrow** (always points to North).
+* Works continuously; smooth animation; battery-friendly.
+
+---
+
+## 0) Install RN deps
+
+```bash
+npm i react-native-svg
+# If you don't have a geo lib already (optional, only for getting last location from JS):
+npm i react-native-geolocation-service
+npx pod-install  # if iOS is present; harmless on Android-only
+```
+
+---
+
+## 1) Android manifest (declination optional)
+
+```xml
+<!-- android/app/src/main/AndroidManifest.xml -->
+<manifest ...>
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+  <application ...>...</application>
+</manifest>
+```
+
+> Location permission is only to correct **magnetic → true north**. Without it, you’ll still get magnetic north.
+
+---
+
+## 2) Native engine (Kotlin)
+
+**Create file**: `android/app/src/main/java/com/yourapp/compass/CompassEngine.kt`
+
+```kotlin
+package com.yourapp.compass
+
+import android.content.Context
+import android.hardware.*
+import android.location.Location
+import kotlin.math.*
+
+class CompassEngine(
+    private val context: Context,
+    private val onHeading: (headingTrueDeg: Float, magMicroT: Float, acc: Int) -> Unit
+) : SensorEventListener {
+
+    private val sm: SensorManager = context.getSystemService(SensorManager::class.java)
+    private val rotVec: Sensor? = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    private val accel: Sensor? = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val mag: Sensor? = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+    private val R = FloatArray(9)
+    private val I = FloatArray(9)
+    private val outR = FloatArray(9)
+    private val orientation = FloatArray(3)
+
+    private val accelVals = FloatArray(3)
+    private val magVals = FloatArray(3)
+    private var hasAccel = false
+    private var hasMag = false
+
+    @Volatile private var lastLocation: Location? = null
+    private var hasSmoothed = false
+    private var smoothedHeading = 0f
+
+    fun updateLocation(loc: Location?) { lastLocation = loc }
+    fun start() {
+        rotVec?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        accel?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        mag?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+    }
+    fun stop() { sm.unregisterListener(this); hasSmoothed = false }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onSensorChanged(ev: SensorEvent) {
+        when (ev.sensor.type) {
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                SensorManager.getRotationMatrixFromVector(R, ev.values)
+                SensorManager.remapCoordinateSystem(R, SensorManager.AXIS_X, SensorManager.AXIS_Y, outR)
+                SensorManager.getOrientation(outR, orientation)
+                var az = Math.toDegrees(orientation[0].toDouble()).toFloat()
+                if (az < 0f) az += 360f
+                dispatchSmoothed(applyDeclination(az), Float.NaN, SensorManager.SENSOR_STATUS_ACCURACY_HIGH)
+            }
+            Sensor.TYPE_ACCELEROMETER -> { System.arraycopy(ev.values, 0, accelVals, 0, 3); hasAccel = true; maybeFallback(null) }
+            Sensor.TYPE_MAGNETIC_FIELD -> { System.arraycopy(ev.values, 0, magVals, 0, 3); hasMag = true; maybeFallback(ev) }
+        }
+    }
+
+    private fun maybeFallback(magEvent: SensorEvent?) {
+        if (hasAccel && hasMag) {
+            if (!SensorManager.getRotationMatrix(R, I, accelVals, magVals)) return
+            SensorManager.remapCoordinateSystem(R, SensorManager.AXIS_X, SensorManager.AXIS_Y, outR)
+            SensorManager.getOrientation(outR, orientation)
+            var az = Math.toDegrees(orientation[0].toDouble()).toFloat()
+            if (az < 0f) az += 360f
+            val trueDeg = applyDeclination(az)
+            val magµT = sqrt(magVals[0]*magVals[0] + magVals[1]*magVals[1] + magVals[2]*magVals[2])
+            val acc = magEvent?.accuracy ?: SensorManager.SENSOR_STATUS_ACCURACY_LOW
+            dispatchSmoothed(trueDeg, magµT, acc)
+        }
+    }
+
+    private fun applyDeclination(magDeg: Float): Float {
+        val loc = lastLocation
+        val decl = if (loc != null)
+            android.hardware.GeomagneticField(
+                loc.latitude.toFloat(), loc.longitude.toFloat(),
+                loc.altitude.toFloat(), System.currentTimeMillis()
+            ).declination
+        else 0f
+        var trueDeg = magDeg + decl
+        trueDeg %= 360f
+        if (trueDeg < 0f) trueDeg += 360f
+        return trueDeg
+    }
+
+    private fun dispatchSmoothed(target: Float, magµT: Float, acc: Int) {
+        val alpha = 0.12f
+        smoothedHeading = if (!hasSmoothed) { hasSmoothed = true; target }
+        else smoothAngle(smoothedHeading, target, alpha)
+        onHeading(smoothedHeading, magµT, acc)
+    }
+
+    private fun smoothAngle(prev: Float, target: Float, alpha: Float): Float {
+        val diff = ((target - prev + 540f) % 360f) - 180f
+        val next = prev + alpha * diff
+        return ((next % 360f) + 360f) % 360f
+    }
+}
+```
+
+---
+
+## 3) RN bridge (Kotlin)
+
+**Create file**: `android/app/src/main/java/com/yourapp/compass/CompassModule.kt`
+
+```kotlin
+package com.yourapp.compass
+
+import android.location.Location
+import com.facebook.react.bridge.*
+import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter
+
+class CompassModule(private val reactContext: ReactApplicationContext)
+  : ReactContextBaseJavaModule(reactContext) {
+
+  private val engine = CompassEngine(reactContext) { heading, mag, acc ->
+    val map = Arguments.createMap()
+    map.putDouble("heading", heading.toDouble())
+    if (!mag.isNaN()) map.putDouble("mag", mag.toDouble())
+    map.putInt("accuracy", acc)
+    sendEvent("CompassHeading", map)
+  }
+
+  override fun getName() = "CompassModule"
+
+  @ReactMethod fun start() { engine.start() }
+  @ReactMethod fun stop() { engine.stop() }
+
+  @ReactMethod
+  fun setDeclinationLocation(lat: Double, lon: Double, alt: Double, promise: Promise) {
+    val loc = Location("js"); loc.latitude = lat; loc.longitude = lon; loc.altitude = alt
+    engine.updateLocation(loc); promise.resolve(null)
+  }
+
+  private fun sendEvent(name: String, params: WritableMap) {
+    reactContext.getJSModule(RCTDeviceEventEmitter::class.java).emit(name, params)
+  }
+}
+```
+
+**Create file**: `android/app/src/main/java/com/yourapp/compass/CompassPackage.kt`
+
+```kotlin
+package com.yourapp.compass
+
+import com.facebook.react.ReactPackage
+import com.facebook.react.bridge.NativeModule
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.uimanager.ViewManager
+
+class CompassPackage : ReactPackage {
+  override fun createNativeModules(rc: ReactApplicationContext): List<NativeModule> =
+    listOf(CompassModule(rc))
+  override fun createViewManagers(rc: ReactApplicationContext): List<ViewManager<*, *>> = emptyList()
+}
+```
+
+**Register package** (if not using separate library):
+
+* Open `android/app/src/main/java/.../MainApplication.java` (or `.kt`) and add:
+
+```java
+import com.yourapp.compass.CompassPackage;
+// inside getPackages():
+packages.add(new CompassPackage());
+```
+
+---
+
+## 4) JS bridge + hook
+
+**Create** `src/native/Compass.ts`
+
+```ts
+import {NativeModules, NativeEventEmitter, EmitterSubscription} from 'react-native';
+
+const { CompassModule } = NativeModules;
+const emitter = new NativeEventEmitter(CompassModule);
+
+export type HeadingEvent = { heading: number; mag?: number; accuracy: number };
+
+export const Compass = {
+  start: () => CompassModule.start(),
+  stop: () => CompassModule.stop(),
+  setDeclinationLocation: (lat: number, lon: number, alt = 0) =>
+    CompassModule.setDeclinationLocation(lat, lon, alt),
+  addListener: (cb: (e: HeadingEvent) => void): EmitterSubscription =>
+    emitter.addListener('CompassHeading', cb),
+};
+```
+
+**Hook** `src/hooks/useCompass.ts`
+
+```ts
+import {useEffect, useRef, useState} from 'react';
+import {Compass, HeadingEvent} from '../native/Compass';
+
+const norm = (v:number)=>((v%360)+360)%360;
+
+export function useCompass() {
+  const [heading, setHeading] = useState(0);
+  const rawRef = useRef(0);
+
+  useEffect(() => {
+    Compass.start();
+    const sub = Compass.addListener((e: HeadingEvent) => {
+      rawRef.current = e.heading;         // already smoothed natively
+      setHeading(norm(rawRef.current));   // keep normalized
+    });
+    return () => { sub.remove(); Compass.stop(); };
+  }, []);
+
+  return heading; // degrees [0..360)
+}
+```
+
+---
+
+## 5) RN UI — ellipse + arrow (SVG)
+
+**Create** `src/components/CompassView.tsx`
+
+```tsx
+import React, {useEffect, useRef} from 'react';
+import {Animated, Easing, View} from 'react-native';
+import Svg, {Ellipse, Polygon} from 'react-native-svg';
+import {useCompass} from '../hooks/useCompass';
+
+const norm = (v:number)=>((v%360)+360)%360;
+const shortestDelta = (from:number, to:number)=>{
+  let d = ((to - from + 540) % 360) - 180;
+  return d;
+};
+
+export default function CompassView({size=260}:{size?:number}) {
+  const heading = useCompass();
+  const anim = useRef(new Animated.Value(0)).current; // degrees
+
+  useEffect(() => {
+    anim.stopAnimation((current:number)=>{
+      const target = norm(current + shortestDelta(current, heading));
+      Animated.timing(anim, {
+        toValue: target,
+        duration: 120,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }).start();
+    });
+  }, [heading]);
+
+  const rotate = anim.interpolate({
+    inputRange: [0, 360],
+    outputRange: ['0deg','360deg'],
+  });
+
+  const w = size, h = size*0.8;
+
+  return (
+    <View style={{width: size, height: size, alignItems:'center', justifyContent:'center'}}>
+      <Svg width={size} height={size}>
+        {/* Ellipse outline */}
+        <Ellipse
+          cx={size/2} cy={size/2}
+          rx={w/2} ry={h/2}
+          stroke="#D0D0D8" strokeWidth={6} fill="transparent"
+        />
+      </Svg>
+
+      <Animated.View style={{
+        position:'absolute', width:size, height:size, alignItems:'center', justifyContent:'center',
+        transform:[{ rotate: Animated.multiply(anim,-1).interpolate({inputRange:[0,360],outputRange:['0deg','360deg']}) }]
+      }}>
+        <Svg width={size} height={size}>
+          {/* Arrow pointing up in local space */}
+          <Polygon
+            points={`${size/2},${size*0.2} ${size/2 - size*0.06},${size*0.55} ${size/2 + size*0.06},${size*0.55}`}
+            fill="#C100E0"
+          />
+        </Svg>
+      </Animated.View>
+    </View>
+  );
+}
+```
+
+**Use it**
+
+```tsx
+import CompassView from './src/components/CompassView';
+export default function Screen(){ return <CompassView size={260} />; }
+```
+
+---
+
+## 6) (Optional) Set declination from JS
+
+If you already have a location (e.g., via `react-native-geolocation-service`):
+
+```ts
+import Geolocation from 'react-native-geolocation-service';
+Geolocation.getCurrentPosition(
+  pos => {
+    const {latitude, longitude, altitude = 0} = pos.coords;
+    Compass.setDeclinationLocation(latitude, longitude, altitude);
+  },
+  err => {},
+  {enableHighAccuracy:true, timeout:10000, maximumAge:0}
+);
+```
+
+---
+
+## 7) Notes / checks
+
+* **Continuous + smooth**: native EMA + JS animation on the **shortest arc**; no 0/360° snapping.
+* **True north** when you call `setDeclinationLocation`; otherwise **magnetic north**.
+* **Interference** is damped natively; you can also expose status to JS if needed.
+* **Expo**: doable with `expo-sensors` + JS math, but for true-north + best stability the above RN-CLI native path is stronger.
+

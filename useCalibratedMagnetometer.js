@@ -79,7 +79,7 @@ export const useCalibratedMagnetometer = () => {
     const subscription = {
       unsubscribe: () => CompassHeading.stop()
     };
-    CompassHeading.start(3, ({ heading }) => {
+    CompassHeading.start(5, ({ heading }) => {
       // Используем heading, полученный из sensor fusion
       const adjustedAngle = (heading + 360) % 360;
       if (lastAngleRef.current === null || Math.abs(adjustedAngle - lastAngleRef.current) >= movementThreshold) {
@@ -127,7 +127,7 @@ export const useCalibratedMagnetometer = () => {
       const compassSubscription = {
         unsubscribe: () => CompassHeading.stop()
       };
-      CompassHeading.start(3, ({heading, accuracy}) => {
+      CompassHeading.start(5, ({heading, accuracy}) => {
         const adjustedAngle = (heading + 360) % 360;
         setCalibratedHeading(adjustedAngle - calibrationOffset);
       });

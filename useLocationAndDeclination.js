@@ -111,6 +111,7 @@ export const useLocationAndDeclination = () => {
           distanceFilter: 13,
           interval: 5000,
           fastestInterval: 2000,
+          maximumAge: 0,
           forceRequestLocation: true,
           showLocationDialog: true,
           // accuracy is supported by this library on both platforms

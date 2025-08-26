@@ -32,6 +32,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>MyTourGuide needs camera access to capture photos for place detection.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>MyTourGuide uses your location to show precise position, heading, and nearby places while the app is in use.</string>
 	<key>UILaunchStoryboardName</key>
