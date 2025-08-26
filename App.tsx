@@ -7,19 +7,25 @@ import { useCalibratedMagnetometer } from './useCalibratedMagnetometer';
 
 const { width, height } = Dimensions.get('window');
 const savePath = `${RNFS.PicturesDirectoryPath}/MyTourGuide`;
-const saveTextPath = `${RNFS.DocumentDirectoryPath}/MyTourGuideText`;
+
+type Coordinates = { latitude: number; longitude: number };
 
 const App = () => {
   const [hasPermission, setHasPermission] = useState<null | boolean>(null);
   const [deviceToUse, setDeviceToUse] = useState<any>(null);
   const [compassDirection, setCompassDirection] = useState<number | null>(null);
-  const [address, setAddress] = useState(null);
+  const [address, setAddress] = useState<string | null>(null);
 
   const devices = useCameraDevices();
-  const camera = useRef(null);
+  const camera = useRef<Camera | null>(null);
   const NUM_CALIBRATION_SAMPLES = 50;
   
-  const { coordinates, magneticDeclination, loadingLocation } = useLocationAndDeclination();
+  const { coordinates, accuracy, magneticDeclination, loadingLocation } = useLocationAndDeclination() as {
+    coordinates: Coordinates | null;
+    accuracy: number | null;
+    magneticDeclination: number;
+    loadingLocation: boolean;
+  };
   const { calibratedHeading, isCalibrating, calibrationMessage, calibrate, finishCalibration, sampleCount  } = useCalibratedMagnetometer();
 
   const checkCameraPermission = async () => {
@@ -38,7 +44,12 @@ const App = () => {
   };
 
 
-function getDestinationPoint(startLatitude, startLongitude, bearing, distance) {
+function getDestinationPoint(
+  startLatitude: number,
+  startLongitude: number,
+  bearing: number,
+  distance: number,
+) {
   const earthRadius = 6371000; // в метрах
   const angularDistance = distance / earthRadius;
   const bearingRad = bearing * Math.PI / 180;
@@ -65,7 +76,7 @@ function getDestinationPoint(startLatitude, startLongitude, bearing, distance) {
   };
 }
 
-const reverseGeocode = async (lat, lon) => {
+const reverseGeocode = async (lat: number, lon: number) => {
   const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&zoom=18`;
   try {
     const response = await fetch(url, {
@@ -147,7 +158,7 @@ const takePhoto = async () => {
   }
   
   try {
-    const photo = await camera.current.takePhoto();
+    const photo = await camera.current!.takePhoto();
     await RNFS.mkdir(savePath);
     const filePath = `${savePath}/photo_${Date.now()}.jpg`;
     console.log('PhotoPath:', filePath);
@@ -157,7 +168,7 @@ const takePhoto = async () => {
     // true heading is tracked continuously via effect
 
 	
-	const computeEndCoordinates = async (distance) => {
+	const computeEndCoordinates = async (distance: number) => {
         if (!coordinates) {
     console.log("Сначала нужно получить координаты");
         return null;
@@ -253,10 +264,11 @@ return (
       </TouchableOpacity>
 	  
 <TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
+
       </TouchableOpacity>
 	  
-{coordinates ? (
-	<View style={styles.coordinatesContainer}>
+      {coordinates ? (
+		<View style={styles.coordinatesContainer}>
         <Text style={styles.coordinatesText}>
           {`Lat: ${coordinates.latitude.toFixed(6)}`}
         </Text>
@@ -264,14 +276,17 @@ return (
           {`Lon: ${coordinates.longitude.toFixed(6)}`}
         </Text>
         <Text style={styles.coordinatesText}>
+          {`Acc: ${accuracy != null ? Math.round(accuracy) : '--'} m`}
+        </Text>
+        <Text style={styles.coordinatesText}>
                 {`Dir: ${compassDirection}°`}
               </Text>
       </View>
 	  ) : (
-  <View style={styles.coordinatesContainer}>
-    <Text style={styles.coordinatesText}>Определяется местоположение...</Text>
-  </View>
-)}
+      <View style={styles.coordinatesContainer}>
+    <Text style={styles.coordinatesText}>{loadingLocation ? 'Определяется местоположение...' : 'Местоположение недоступно'}</Text>
+      </View>
+    )}
 
 {address && (
         <View style={styles.addressContainer}>

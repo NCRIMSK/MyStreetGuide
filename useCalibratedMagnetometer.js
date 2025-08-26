@@ -5,8 +5,6 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 // ADD: импортируем библиотеку, которая использует sensor fusion
 import CompassHeading from 'react-native-compass-heading';
 
-const NUM_CALIBRATION_SAMPLES = 50; // Количество измерений для калибровки
-
 export const useCalibratedMagnetometer = () => {
   const [calibratedHeading, setCalibratedHeading] = useState(null);
   const [calibrationOffset, setCalibrationOffset] = useState(0);
