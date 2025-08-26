@@ -21,17 +21,19 @@ const requestLocationPermission = async () => {
 
 const getMagneticDeclination = async (lat, lon) => {
   try {
-    const apiKey = "zNEw7"; 
-    const response = await fetch(`https://www.ngdc.noaa.gov/geomag-web/calculators/calculateDeclination?lat1=${lat}&lon1=${lon}&key=${apiKey}&resultFormat=json`);
+    const apiKey = 'zNEw7';
+    const response = await fetch(
+      `https://www.ngdc.noaa.gov/geomag-web/calculators/calculateDeclination?lat1=${lat}&lon1=${lon}&key=${apiKey}&resultFormat=json`,
+    );
     const data = await response.json();
     if (data.result && data.result.length > 0) {
       return data.result[0].declination;
     } else {
-      console.error("Нет данных о склонении");
+      console.error('Нет данных о склонении');
       return 0;
     }
   } catch (error) {
-    console.error("Ошибка при запросе склонения:", error);
+    console.error('Ошибка при запросе склонения:', error);
     return 0;
   }
 };
@@ -43,8 +45,10 @@ const distMeters = (lat1, lon1, lat2, lon2) => {
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 };
@@ -57,7 +61,21 @@ export const useLocationAndDeclination = () => {
   const [loadingLocation, setLoadingLocation] = useState(true);
 
   const watchIdRef = useRef(null);
-  const lastDeclRef = useRef({ lat: null, lon: null, ts: 0 });
+  const lastDeclRef = useRef({lat: null, lon: null, ts: 0});
+  const lastPositionsRef = useRef([]);
+
+  const pushPosition = (lat, lon) => {
+    lastPositionsRef.current.push({lat, lon});
+    if (lastPositionsRef.current.length > 5) {
+      lastPositionsRef.current.shift();
+    }
+    const len = lastPositionsRef.current.length;
+    const avgLat =
+      lastPositionsRef.current.reduce((s, p) => s + p.lat, 0) / len;
+    const avgLon =
+      lastPositionsRef.current.reduce((s, p) => s + p.lon, 0) / len;
+    return {latitude: avgLat, longitude: avgLon};
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -69,40 +87,59 @@ export const useLocationAndDeclination = () => {
         return;
       }
 
+      const handlePosition = async ({coords}) => {
+        const {latitude, longitude, accuracy: acc} = coords || {};
+        if (typeof acc === 'number' && acc > 50) {
+          return;
+        }
+        if (!mounted) return;
+        const averaged = pushPosition(latitude, longitude);
+        setCoordinates(averaged);
+        setAccuracy(typeof acc === 'number' ? Math.round(acc) : null);
+        setLoadingLocation(false);
+
+        // Update declination only when needed (first fix, >1km move, or >6h elapsed)
+        const last = lastDeclRef.current;
+        const needDeclination =
+          !last.lat ||
+          !last.lon ||
+          distMeters(latitude, longitude, last.lat, last.lon) > 1000 ||
+          Date.now() - last.ts > 6 * 60 * 60 * 1000;
+
+        if (needDeclination) {
+          try {
+            const decl = await getMagneticDeclination(latitude, longitude);
+            if (!mounted) return;
+            setMagneticDeclinationState(decl);
+            lastDeclRef.current = {
+              lat: latitude,
+              lon: longitude,
+              ts: Date.now(),
+            };
+          } catch (e) {
+            // noop, keep last known declination
+          }
+        }
+      };
+
+      Geolocation.getCurrentPosition(
+        handlePosition,
+        error => {
+          console.log('Ошибка получения позиции:', error);
+          setLoadingLocation(false);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 15000,
+          maximumAge: 0,
+          accuracy: {android: 'high', ios: 'best'},
+        },
+      );
+
       // Continuous updates, ~5s, with high accuracy and jitter control
       watchIdRef.current = Geolocation.watchPosition(
-        async ({ coords }) => {
-          const { latitude, longitude, accuracy: acc } = coords || {};
-          // Drop very poor fixes to avoid teleports/jitter
-          if (typeof acc === 'number' && acc > 80) {
-            return;
-          }
-          if (!mounted) return;
-
-          setCoordinates({ latitude, longitude });
-          setAccuracy(typeof acc === 'number' ? Math.round(acc) : null);
-          setLoadingLocation(false);
-
-          // Update declination only when needed (first fix, >1km move, or >6h elapsed)
-          const last = lastDeclRef.current;
-          const needDeclination =
-            !last.lat ||
-            !last.lon ||
-            distMeters(latitude, longitude, last.lat, last.lon) > 1000 ||
-            Date.now() - last.ts > 6 * 60 * 60 * 1000;
-
-          if (needDeclination) {
-            try {
-              const decl = await getMagneticDeclination(latitude, longitude);
-              if (!mounted) return;
-              setMagneticDeclinationState(decl);
-              lastDeclRef.current = { lat: latitude, lon: longitude, ts: Date.now() };
-            } catch (e) {
-              // noop, keep last known declination
-            }
-          }
-        },
-        (error) => {
+        handlePosition,
+        error => {
           console.log('Ошибка получения позиции:', error);
           setLoadingLocation(false);
         },
@@ -114,8 +151,7 @@ export const useLocationAndDeclination = () => {
           maximumAge: 0,
           forceRequestLocation: true,
           showLocationDialog: true,
-          // accuracy is supported by this library on both platforms
-          accuracy: { android: 'high', ios: 'best' },
+          accuracy: {android: 'high', ios: 'best'},
         },
       );
     };
@@ -131,5 +167,5 @@ export const useLocationAndDeclination = () => {
     };
   }, []);
 
-  return { coordinates, accuracy, magneticDeclination, loadingLocation };
+  return {coordinates, accuracy, magneticDeclination, loadingLocation};
 };
