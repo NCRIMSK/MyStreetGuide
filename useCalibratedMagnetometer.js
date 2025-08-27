@@ -72,10 +72,6 @@ export const useCalibratedMagnetometer = () => {
   }, [finishCalibration]);
 
   useEffect(() => {
-
-    calibrate();
-    return () => {
-
     const accelSub = accelerometer.subscribe(({x, y, z}) => {
       const pitch = Math.atan2(-x, Math.sqrt(y * y + z * z)) * (180 / Math.PI);
       const roll = Math.atan2(y, z) * (180 / Math.PI);
@@ -95,6 +91,7 @@ export const useCalibratedMagnetometer = () => {
         isTiltedRef.current = !vertical;
       }
     });
+
     calibrate();
     return () => {
       accelSub.unsubscribe();
@@ -116,9 +113,6 @@ export const useCalibratedMagnetometer = () => {
       subscription.unsubscribe();
     };
   }, []);
-
-  const handleHeading = useCallback(
-    ({heading}) => {
 
   const handleHeading = useCallback(
     ({heading}) => {
