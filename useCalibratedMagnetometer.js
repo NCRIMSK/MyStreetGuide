@@ -1,6 +1,10 @@
 import {useEffect, useState, useRef, useCallback} from 'react';
 import CompassHeading from 'react-native-compass-heading';
-import {accelerometer} from 'react-native-sensors';
+import {
+  accelerometer,
+  setUpdateIntervalForType,
+  SensorTypes,
+} from 'react-native-sensors';
 
 export const NUM_CALIBRATION_SAMPLES = 50;
 
@@ -14,10 +18,12 @@ export const useCalibratedMagnetometer = () => {
   const samplesRef = useRef([]);
   const lastAngleRef = useRef(null);
   const stableHeadingRef = useRef(null);
-  const isTiltedRef = useRef(false);
   const isCalibratingRef = useRef(true);
   const calibrationTimeoutRef = useRef(null);
   const calibrationOffsetRef = useRef(0);
+
+  const isTiltedRef = useRef(false);
+
 
   const movementThreshold = 2;
 
@@ -50,11 +56,14 @@ export const useCalibratedMagnetometer = () => {
     }
     samplesRef.current = [];
     lastAngleRef.current = null;
+    stableHeadingRef.current = null;
     setSampleCount(0);
 
     setIsCalibrating(true);
     isCalibratingRef.current = true;
+
     setCalibrationMessage('Двигайте телефон горизонтально восьмерками');
+
 
     const timeout = setTimeout(() => {
       finishCalibration();
@@ -63,6 +72,10 @@ export const useCalibratedMagnetometer = () => {
   }, [finishCalibration]);
 
   useEffect(() => {
+
+    calibrate();
+    return () => {
+
     const accelSub = accelerometer.subscribe(({x, y, z}) => {
       const pitch = Math.atan2(-x, Math.sqrt(y * y + z * z)) * (180 / Math.PI);
       const roll = Math.atan2(y, z) * (180 / Math.PI);
@@ -85,17 +98,34 @@ export const useCalibratedMagnetometer = () => {
     calibrate();
     return () => {
       accelSub.unsubscribe();
+
       if (calibrationTimeoutRef.current) {
         clearTimeout(calibrationTimeoutRef.current);
       }
     };
   }, [calibrate]);
 
+  useEffect(() => {
+    setUpdateIntervalForType(SensorTypes.accelerometer, 100);
+    const subscription = accelerometer.subscribe(({x, y, z}) => {
+      const magnitude = Math.sqrt(x * x + y * y + z * z) || 1;
+      const normalizedZ = z / magnitude;
+      isTiltedRef.current = Math.abs(normalizedZ) > 0.5;
+    });
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const handleHeading = useCallback(
+    ({heading}) => {
+
   const handleHeading = useCallback(
     ({heading}) => {
       if (isTiltedRef.current) {
         return;
       }
+
       const adjustedAngle = (heading + 360) % 360;
       if (isCalibratingRef.current) {
         if (
@@ -110,11 +140,19 @@ export const useCalibratedMagnetometer = () => {
           }
         }
       } else {
+
+        if (isTiltedRef.current) {
+          return;
+        }
+
         if (stableHeadingRef.current == null) {
           stableHeadingRef.current = adjustedAngle;
         } else {
           let diff =
             ((adjustedAngle - stableHeadingRef.current + 540) % 360) - 180;
+          if (Math.abs(diff) > 150) {
+            return;
+          }
           stableHeadingRef.current =
             (stableHeadingRef.current + diff * 0.1 + 360) % 360;
         }
@@ -127,11 +165,16 @@ export const useCalibratedMagnetometer = () => {
   );
 
   useEffect(() => {
+
+    CompassHeading.stop();
+
     CompassHeading.start(1, handleHeading);
     return () => {
       CompassHeading.stop();
     };
-  }, [handleHeading]);
+
+  }, [handleHeading, isCalibrating]);
+
 
   return {
     calibratedHeading,
