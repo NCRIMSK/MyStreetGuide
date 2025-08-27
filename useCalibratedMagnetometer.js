@@ -21,7 +21,9 @@ export const useCalibratedMagnetometer = () => {
   const isCalibratingRef = useRef(true);
   const calibrationTimeoutRef = useRef(null);
   const calibrationOffsetRef = useRef(0);
+
   const isTiltedRef = useRef(false);
+
 
   const movementThreshold = 2;
 
@@ -59,7 +61,9 @@ export const useCalibratedMagnetometer = () => {
 
     setIsCalibrating(true);
     isCalibratingRef.current = true;
-    setCalibrationMessage('Двигайте телефон восьмерками');
+
+    setCalibrationMessage('Двигайте телефон горизонтально восьмерками');
+
 
     const timeout = setTimeout(() => {
       finishCalibration();
@@ -68,8 +72,33 @@ export const useCalibratedMagnetometer = () => {
   }, [finishCalibration]);
 
   useEffect(() => {
+
     calibrate();
     return () => {
+
+    const accelSub = accelerometer.subscribe(({x, y, z}) => {
+      const pitch = Math.atan2(-x, Math.sqrt(y * y + z * z)) * (180 / Math.PI);
+      const roll = Math.atan2(y, z) * (180 / Math.PI);
+      if (isCalibratingRef.current) {
+        const horizontal = Math.abs(pitch) <= 30 && Math.abs(roll) <= 30;
+        isTiltedRef.current = !horizontal;
+        setCalibrationMessage(
+          horizontal
+            ? 'Двигайте телефон горизонтально восьмерками'
+            : 'Держите телефон горизонтально',
+        );
+      } else {
+        const vertical =
+          Math.abs(pitch) >= 60 &&
+          Math.abs(pitch) <= 120 &&
+          Math.abs(roll) <= 45;
+        isTiltedRef.current = !vertical;
+      }
+    });
+    calibrate();
+    return () => {
+      accelSub.unsubscribe();
+
       if (calibrationTimeoutRef.current) {
         clearTimeout(calibrationTimeoutRef.current);
       }
@@ -90,6 +119,13 @@ export const useCalibratedMagnetometer = () => {
 
   const handleHeading = useCallback(
     ({heading}) => {
+
+  const handleHeading = useCallback(
+    ({heading}) => {
+      if (isTiltedRef.current) {
+        return;
+      }
+
       const adjustedAngle = (heading + 360) % 360;
       if (isCalibratingRef.current) {
         if (
@@ -104,9 +140,11 @@ export const useCalibratedMagnetometer = () => {
           }
         }
       } else {
+
         if (isTiltedRef.current) {
           return;
         }
+
         if (stableHeadingRef.current == null) {
           stableHeadingRef.current = adjustedAngle;
         } else {
@@ -127,12 +165,16 @@ export const useCalibratedMagnetometer = () => {
   );
 
   useEffect(() => {
+
     CompassHeading.stop();
+
     CompassHeading.start(1, handleHeading);
     return () => {
       CompassHeading.stop();
     };
+
   }, [handleHeading, isCalibrating]);
+
 
   return {
     calibratedHeading,
@@ -143,3 +185,4 @@ export const useCalibratedMagnetometer = () => {
     sampleCount,
   };
 };
+
